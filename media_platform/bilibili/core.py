@@ -4,16 +4,16 @@
 # @Desc    : B站爬虫
 
 import asyncio
-import os
 import random
+import os
 from asyncio import Task
 from typing import Dict, List, Optional, Tuple, Union
 
 from playwright.async_api import (BrowserContext, BrowserType, Page,
                                   async_playwright)
 
-import config
 from base.base_crawler import AbstractCrawler
+from config.context import CrawlerContext
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import bilibili as bilibili_store
 from tools import utils
@@ -34,76 +34,56 @@ class BilibiliCrawler(AbstractCrawler):
         self.index_url = "https://www.bilibili.com"
         self.user_agent = utils.get_user_agent()
 
-    async def start(self):
+    async def start(self, context: CrawlerContext):
         playwright_proxy_format, httpx_proxy_format = None, None
-        if config.ENABLE_IP_PROXY:
-            ip_proxy_pool = await create_ip_pool(config.IP_PROXY_POOL_COUNT, enable_validate_ip=True)
+        if context.enable_ip_proxy:
+            ip_proxy_pool = await create_ip_pool(context.ip_proxy_pool_count, enable_validate_ip=True)
             ip_proxy_info: IpInfoModel = await ip_proxy_pool.get_proxy()
-            playwright_proxy_format, httpx_proxy_format = self.format_proxy_info(
-                ip_proxy_info)
+            playwright_proxy_format, httpx_proxy_format = self.format_proxy_info(ip_proxy_info)
 
         async with async_playwright() as playwright:
-            # Launch a browser context.
             chromium = playwright.chromium
-            self.browser_context = await self.launch_browser(
-                chromium,
-                None,
-                self.user_agent,
-                headless=config.HEADLESS
-            )
-            # stealth.min.js is a js script to prevent the website from detecting the crawler.
+            self.browser_context = await self.launch_browser(context, chromium, playwright_proxy_format, self.user_agent)
             await self.browser_context.add_init_script(path="libs/stealth.min.js")
             self.context_page = await self.browser_context.new_page()
             await self.context_page.goto(self.index_url)
 
-            # Create a client to interact with the xiaohongshu website.
-            self.bili_client = await self.create_bilibili_client(httpx_proxy_format)
+            self.bili_client = await self.create_bilibili_client(context, httpx_proxy_format)
             if not await self.bili_client.pong():
                 login_obj = BilibiliLogin(
-                    login_type=config.LOGIN_TYPE,
+                    login_type=context.login_type,
                     login_phone="",  # your phone number
                     browser_context=self.browser_context,
                     context_page=self.context_page,
-                    cookie_str=config.COOKIES
+                    cookie_str=context.cookies
                 )
                 await login_obj.begin()
                 await self.bili_client.update_cookies(browser_context=self.browser_context)
 
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
-                # Search for video and retrieve their comment information.
-                await self.search()
-            elif config.CRAWLER_TYPE == "detail":
-                # Get the information and comments of the specified post
-                await self.get_specified_videos(config.BILI_SPECIFIED_ID_LIST)
-            elif config.CRAWLER_TYPE == "creator":
-                for creator_id in config.BILI_CREATOR_ID_LIST:
-                    await self.get_creator_videos(int(creator_id))
-            else:
-                pass
-            utils.logger.info(
-                "[BilibiliCrawler.start] Bilibili Crawler finished ...")
+            crawler_type_var.set(context.crawler_type)
+            if context.crawler_type == "search":
+                await self.search(context)
+            elif context.crawler_type == "detail":
+                await self.get_specified_videos(context, context.bili_specified_id_list)
+            elif context.crawler_type == "creator":
+                for creator_id in context.bili_creator_id_list:
+                    await self.get_creator_videos(context, int(creator_id))
+            
+            utils.logger.info("[BilibiliCrawler.start] Bilibili Crawler finished ...")
 
-    async def search(self):
-        """
-        search bilibili video with keywords
-        :return:
-        """
-        utils.logger.info(
-            "[BilibiliCrawler.search] Begin search bilibli keywords")
-        bili_limit_count = 20  # bilibili limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < bili_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = bili_limit_count
-        start_page = config.START_PAGE  # start page number
-        for keyword in config.KEYWORDS.split(","):
+    async def search(self, context: CrawlerContext):
+        utils.logger.info("[BilibiliCrawler.search] Begin search bilibli keywords")
+        bili_limit_count = 20
+        if context.crawler_max_notes_count < bili_limit_count:
+            context.crawler_max_notes_count = bili_limit_count
+        start_page = context.start_page
+        for keyword in context.keywords.split(","):
             source_keyword_var.set(keyword)
-            utils.logger.info(
-                f"[BilibiliCrawler.search] Current search keyword: {keyword}")
+            utils.logger.info(f"[BilibiliCrawler.search] Current search keyword: {keyword}")
             page = 1
-            while (page - start_page + 1) * bili_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+            while (page - start_page + 1) * bili_limit_count <= context.crawler_max_notes_count:
                 if page < start_page:
-                    utils.logger.info(
-                        f"[BilibiliCrawler.search] Skip page: {page}")
+                    utils.logger.info(f"[BilibiliCrawler.search] Skip page: {page}")
                     page += 1
                     continue
 
@@ -117,10 +97,9 @@ class BilibiliCrawler(AbstractCrawler):
                 )
                 video_list: List[Dict] = videos_res.get("result")
 
-                semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+                semaphore = asyncio.Semaphore(context.max_concurrency_num)
                 task_list = [
-                    self.get_video_info_task(aid=video_item.get(
-                        "aid"), bvid="", semaphore=semaphore)
+                    self.get_video_info_task(aid=video_item.get("aid"), bvid="", semaphore=semaphore)
                     for video_item in video_list
                 ]
                 video_items = await asyncio.gather(*task_list)
@@ -129,61 +108,40 @@ class BilibiliCrawler(AbstractCrawler):
                         video_id_list.append(video_item.get("View").get("aid"))
                         await bilibili_store.update_bilibili_video(video_item)
                         await bilibili_store.update_up_info(video_item)
-                        await self.get_bilibili_video(video_item, semaphore)
+                        await self.get_bilibili_video(context, video_item, semaphore)
                 page += 1
                 await self.batch_get_video_comments(video_id_list)
 
-    async def batch_get_video_comments(self, video_id_list: List[str]):
-        """
-        batch get video comments
-        :param video_id_list:
-        :return:
-        """
-        if not config.ENABLE_GET_COMMENTS:
-            utils.logger.info(
-                f"[BilibiliCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
+    async def batch_get_video_comments(self, context: CrawlerContext, video_id_list: List[str]):
+        if not context.enable_get_comments:
+            utils.logger.info(f"[BilibiliCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
             return
 
-        utils.logger.info(
-            f"[BilibiliCrawler.batch_get_video_comments] video ids:{video_id_list}")
-        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+        utils.logger.info(f"[BilibiliCrawler.batch_get_video_comments] video ids:{video_id_list}")
+        semaphore = asyncio.Semaphore(context.max_concurrency_num)
         task_list: List[Task] = []
         for video_id in video_id_list:
-            task = asyncio.create_task(self.get_comments(
-                video_id, semaphore), name=video_id)
+            task = asyncio.create_task(self.get_comments(context, video_id, semaphore), name=video_id)
             task_list.append(task)
         await asyncio.gather(*task_list)
 
-    async def get_comments(self, video_id: str, semaphore: asyncio.Semaphore):
-        """
-        get comment for video id
-        :param video_id:
-        :param semaphore:
-        :return:
-        """
+    async def get_comments(self, context: CrawlerContext, video_id: str, semaphore: asyncio.Semaphore):
         async with semaphore:
             try:
-                utils.logger.info(
-                    f"[BilibiliCrawler.get_comments] begin get video_id: {video_id} comments ...")
+                utils.logger.info(f"[BilibiliCrawler.get_comments] begin get video_id: {video_id} comments ...")
                 await self.bili_client.get_video_all_comments(
                     video_id=video_id,
                     crawl_interval=random.random(),
-                    is_fetch_sub_comments=config.ENABLE_GET_SUB_COMMENTS,
+                    is_fetch_sub_comments=context.enable_get_sub_comments,
                     callback=bilibili_store.batch_update_bilibili_video_comments
                 )
 
             except DataFetchError as ex:
-                utils.logger.error(
-                    f"[BilibiliCrawler.get_comments] get video_id: {video_id} comment error: {ex}")
+                utils.logger.error(f"[BilibiliCrawler.get_comments] get video_id: {video_id} comment error: {ex}")
             except Exception as e:
-                utils.logger.error(
-                    f"[BilibiliCrawler.get_comments] may be been blocked, err:{e}")
+                utils.logger.error(f"[BilibiliCrawler.get_comments] may be been blocked, err:{e}")
 
-    async def get_creator_videos(self, creator_id: int):
-        """
-        get videos for a creator
-        :return:
-        """
+    async def get_creator_videos(self, context: CrawlerContext, creator_id: int):
         ps = 30
         pn = 1
         video_bvids_list = []
@@ -195,14 +153,10 @@ class BilibiliCrawler(AbstractCrawler):
                 break
             await asyncio.sleep(random.random())
             pn += 1
-        await self.get_specified_videos(video_bvids_list)
+        await self.get_specified_videos(context, video_bvids_list)
 
-    async def get_specified_videos(self, bvids_list: List[str]):
-        """
-        get specified videos info
-        :return:
-        """
-        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+    async def get_specified_videos(self, context: CrawlerContext, bvids_list: List[str]):
+        semaphore = asyncio.Semaphore(context.max_concurrency_num)
         task_list = [
             self.get_video_info_task(aid=0, bvid=video_id, semaphore=semaphore) for video_id in
             bvids_list
@@ -216,81 +170,51 @@ class BilibiliCrawler(AbstractCrawler):
                 if video_aid:
                     video_aids_list.append(video_aid)
                 await bilibili_store.update_bilibili_video(video_detail)
-                await self.get_bilibili_video(video_detail, semaphore)
-        await self.batch_get_video_comments(video_aids_list)
+                await self.get_bilibili_video(context, video_detail, semaphore)
+        await self.batch_get_video_comments(context, video_aids_list)
 
     async def get_video_info_task(self, aid: int, bvid: str, semaphore: asyncio.Semaphore) -> Optional[Dict]:
-        """
-        Get video detail task
-        :param aid:
-        :param bvid:
-        :param semaphore:
-        :return:
-        """
         async with semaphore:
             try:
                 result = await self.bili_client.get_video_info(aid=aid, bvid=bvid)
                 return result
             except DataFetchError as ex:
-                utils.logger.error(
-                    f"[BilibiliCrawler.get_video_info_task] Get video detail error: {ex}")
+                utils.logger.error(f"[BilibiliCrawler.get_video_info_task] Get video detail error: {ex}")
                 return None
             except KeyError as ex:
-                utils.logger.error(
-                    f"[BilibiliCrawler.get_video_info_task] have not fund note detail video_id:{bvid}, err: {ex}")
+                utils.logger.error(f"[BilibiliCrawler.get_video_info_task] have not fund note detail video_id:{bvid}, err: {ex}")
                 return None
 
     async def get_video_play_url_task(self, aid: int, cid: int, semaphore: asyncio.Semaphore) -> Union[Dict, None]:
-        """
-                Get video play url
-                :param aid:
-                :param cid:
-                :param semaphore:
-                :return:
-                """
         async with semaphore:
             try:
                 result = await self.bili_client.get_video_play_url(aid=aid, cid=cid)
                 return result
             except DataFetchError as ex:
-                utils.logger.error(
-                    f"[BilibiliCrawler.get_video_play_url_task] Get video play url error: {ex}")
+                utils.logger.error(f"[BilibiliCrawler.get_video_play_url_task] Get video play url error: {ex}")
                 return None
             except KeyError as ex:
-                utils.logger.error(
-                    f"[BilibiliCrawler.get_video_play_url_task] have not fund play url from :{aid}|{cid}, err: {ex}")
+                utils.logger.error(f"[BilibiliCrawler.get_video_play_url_task] have not fund play url from :{aid}|{cid}, err: {ex}")
                 return None
 
-    async def create_bilibili_client(self, httpx_proxy: Optional[str]) -> BilibiliClient:
-        """
-        create bilibili client
-        :param httpx_proxy: httpx proxy
-        :return: bilibili client
-        """
-        utils.logger.info(
-            "[BilibiliCrawler.create_bilibili_client] Begin create bilibili API client ...")
+    async def create_bilibili_client(self, context: CrawlerContext, httpx_proxy: Optional[str]) -> BilibiliClient:
+        utils.logger.info("[BilibiliCrawler.create_bilibili_client] Begin create bilibili API client ...")
         cookie_str, cookie_dict = utils.convert_cookies(await self.browser_context.cookies())
-        bilibili_client_obj = BilibiliClient(
+        bili_client_obj = BilibiliClient(
             proxies=httpx_proxy,
             headers={
                 "User-Agent": self.user_agent,
                 "Cookie": cookie_str,
                 "Origin": "https://www.bilibili.com",
                 "Referer": "https://www.bilibili.com",
-                "Content-Type": "application/json;charset=UTF-8"
             },
             playwright_page=self.context_page,
             cookie_dict=cookie_dict,
         )
-        return bilibili_client_obj
+        return bili_client_obj
 
     @staticmethod
     def format_proxy_info(ip_proxy_info: IpInfoModel) -> Tuple[Optional[Dict], Optional[Dict]]:
-        """
-        format proxy info for playwright and httpx
-        :param ip_proxy_info: ip proxy info
-        :return: playwright proxy, httpx proxy
-        """
         playwright_proxy = {
             "server": f"{ip_proxy_info.protocol}{ip_proxy_info.ip}:{ip_proxy_info.port}",
             "username": ip_proxy_info.user,
@@ -301,54 +225,29 @@ class BilibiliCrawler(AbstractCrawler):
         }
         return playwright_proxy, httpx_proxy
 
-    async def launch_browser(
-            self,
-            chromium: BrowserType,
-            playwright_proxy: Optional[Dict],
-            user_agent: Optional[str],
-            headless: bool = True
-    ) -> BrowserContext:
-        """ 
-        launch browser and create browser context
-        :param chromium: chromium browser
-        :param playwright_proxy: playwright proxy
-        :param user_agent: user agent
-        :param headless: headless mode
-        :return: browser context
-        """
-        utils.logger.info(
-            "[BilibiliCrawler.launch_browser] Begin create browser context ...")
-        if config.SAVE_LOGIN_STATE:
-            # feat issue #14
-            # we will save login state to avoid login every time
-            user_data_dir = os.path.join(os.getcwd(), "browser_data",
-                                         config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
+    async def launch_browser(self, context: CrawlerContext, chromium: BrowserType, playwright_proxy: Optional[Dict], user_agent: Optional[str]) -> BrowserContext:
+        utils.logger.info("[BilibiliCrawler.launch_browser] Begin create browser context ...")
+        if context.save_login_state:
+            user_data_dir = os.path.join(os.getcwd(), "browser_data", context.user_data_dir % context.platform)
             browser_context = await chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 accept_downloads=True,
-                headless=headless,
-                proxy=playwright_proxy,  # type: ignore
+                headless=context.headless,
+                proxy=playwright_proxy,
                 viewport={"width": 1920, "height": 1080},
                 user_agent=user_agent
             )
             return browser_context
         else:
-            # type: ignore
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)
+            browser = await chromium.launch(headless=context.headless, proxy=playwright_proxy)
             browser_context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent=user_agent
             )
             return browser_context
 
-    async def get_bilibili_video(self, video_item: Dict, semaphore: asyncio.Semaphore):
-        """
-        download bilibili video
-        :param video_item:
-        :param semaphore:
-        :return:
-        """
-        if not config.ENABLE_GET_IMAGES:
+    async def get_bilibili_video(self, context: CrawlerContext, video_item: Dict, semaphore: asyncio.Semaphore):
+        if not context.enable_get_images:
             utils.logger.info(f"[BilibiliCrawler.get_bilibili_video] Crawling image mode is not enabled")
             return
         video_item_view: Dict = video_item.get("View")

@@ -1,8 +1,8 @@
 import asyncio
 import sys
-
+import json
+from config.context import CrawlerContext
 import cmd_arg
-import config
 import db
 from base.base_crawler import AbstractCrawler
 from media_platform.bilibili import BilibiliCrawler
@@ -34,20 +34,26 @@ class CrawlerFactory:
 
 
 async def main():
+    # 读取配置文件
+    with open('config/web_config.json', 'r') as config_file:
+        config = json.load(config_file)
+
+    # 创建上下文
+    context = CrawlerContext.from_dict(config)
+
     # parse cmd
     await cmd_arg.parse_cmd()
 
     # init db
-    if config.SAVE_DATA_OPTION == "db":
+    if context.save_data_option == "db":
         await db.init_db()
 
-    crawler = CrawlerFactory.create_crawler(platform=config.PLATFORM)
-    await crawler.start()
+    crawler = CrawlerFactory.create_crawler(platform=context.platform)
+    await crawler.start(context)
 
-    if config.SAVE_DATA_OPTION == "db":
+    if context.save_data_option == "db":
         await db.close()
 
-    
 
 if __name__ == '__main__':
     try:

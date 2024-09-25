@@ -1,33 +1,30 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Optional
+from config.context import CrawlerContext
 
 from playwright.async_api import BrowserContext, BrowserType
 
 
 class AbstractCrawler(ABC):
     @abstractmethod
-    async def start(self):
-        """
-        start crawler
-        """
+    async def start(self, context: CrawlerContext) -> None:
         pass
 
     @abstractmethod
-    async def search(self):
+    async def search(self, context: CrawlerContext):
         """
         search
         """
         pass
 
     @abstractmethod
-    async def launch_browser(self, chromium: BrowserType, playwright_proxy: Optional[Dict], user_agent: Optional[str],
-                             headless: bool = True) -> BrowserContext:
+    async def launch_browser(self, context: CrawlerContext, chromium: BrowserType, playwright_proxy: Optional[Dict], user_agent: Optional[str]) -> BrowserContext:
         """
         launch browser
+        :param context: crawler context
         :param chromium: chromium browser
         :param playwright_proxy: playwright proxy
         :param user_agent: user agent
-        :param headless: headless mode
         :return: browser context
         """
         pass

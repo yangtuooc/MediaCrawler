@@ -5,7 +5,7 @@ from typing import Optional
 
 from playwright.async_api import BrowserContext, Page
 from tenacity import (RetryError, retry, retry_if_result, stop_after_attempt,
-                      wait_fixed)
+                      wait_fixed, stop_after_delay)
 
 import config
 from base.base_crawler import AbstractLogin
@@ -27,36 +27,63 @@ class XiaoHongShuLogin(AbstractLogin):
         self.context_page = context_page
         self.login_phone = login_phone
         self.cookie_str = cookie_str
+        self.stop_flag = False  # 添加停止标志
 
-    @retry(stop=stop_after_attempt(600), wait=wait_fixed(1), retry=retry_if_result(lambda value: value is False))
+    @retry(stop=(stop_after_attempt(600) | stop_after_delay(300)), 
+           wait=wait_fixed(1), 
+           retry=retry_if_result(lambda value: value is False))
     async def check_login_state(self, no_logged_in_session: str) -> bool:
-        """
-            Check if the current login status is successful and return True otherwise return False
-            retry decorator will retry 20 times if the return value is False, and the retry interval is 1 second
-            if max retry times reached, raise RetryError
-        """
-
-        if "请通过验证" in await self.context_page.content():
-            utils.logger.info("[XiaoHongShuLogin.check_login_state] 登录过程中出现验证码，请手动验证")
+        if self.stop_flag:
+            utils.logger.info("[XiaoHongShuLogin.check_login_state] Login process stopped by user")
+            return True  # 改为返回 True 以结束重试
 
         current_cookie = await self.browser_context.cookies()
-        _, cookie_dict = utils.convert_cookies(current_cookie)
-        current_web_session = cookie_dict.get("web_session")
-        if current_web_session != no_logged_in_session:
+        current_session = next((cookie for cookie in current_cookie if cookie["name"] == "web_session"), None)
+        if current_session and current_session["value"] != no_logged_in_session:
+            utils.logger.info("[XiaoHongShuLogin.check_login_state] Login successful")
             return True
-        return False
+        else:
+            utils.logger.info("[XiaoHongShuLogin.check_login_state] 登录过程中出现验证码，请手动验证")
+            return False
 
     async def begin(self):
         """Start login xiaohongshu"""
         utils.logger.info("[XiaoHongShuLogin.begin] Begin login xiaohongshu ...")
-        if config.LOGIN_TYPE == "qrcode":
-            await self.login_by_qrcode()
-        elif config.LOGIN_TYPE == "phone":
-            await self.login_by_mobile()
-        elif config.LOGIN_TYPE == "cookie":
-            await self.login_by_cookies()
-        else:
-            raise ValueError("[XiaoHongShuLogin.begin]I nvalid Login Type Currently only supported qrcode or phone or cookies ...")
+        try:
+            no_logged_in_session = next((cookie for cookie in await self.browser_context.cookies() if cookie["name"] == "web_session"), None)
+            if no_logged_in_session:
+                no_logged_in_session = no_logged_in_session["value"]
+            else:
+                no_logged_in_session = ""
+
+            if config.LOGIN_TYPE == "qrcode":
+                await self.login_by_qrcode()
+            elif config.LOGIN_TYPE == "phone":
+                await self.login_by_mobile()
+            elif config.LOGIN_TYPE == "cookie":
+                await self.login_by_cookies()
+            else:
+                raise ValueError("[XiaoHongShuLogin.begin] Invalid Login Type. Currently only supported qrcode or phone or cookies ...")
+
+            await self.handle_captcha()  # 处理可能出现的验证码
+
+            login_success = await self.check_login_state(no_logged_in_session)
+            if not login_success:
+                utils.logger.info("登录未成功，可能需要进一步处理。")
+                # 这里可以添加额外的处理逻辑，比如重试登录或者抛出异常
+        except RetryError:
+            if not self.stop_flag:
+                utils.logger.error("[XiaoHongShuLogin.begin] Login failed after multiple attempts")
+                sys.exit()
+
+    async def stop(self):
+        self.stop_flag = True
+        try:
+            # 关闭任何需要关闭的资源
+            pass
+        except Exception as e:
+            utils.logger.error(f"Error during XiaoHongShuLogin stop: {str(e)}")
+        utils.logger.info("[XiaoHongShuLogin.stop] Login process stopped")
 
     async def login_by_mobile(self):
         """Login xiaohongshu by mobile"""
@@ -184,3 +211,29 @@ class XiaoHongShuLogin(AbstractLogin):
                 'domain': ".xiaohongshu.com",
                 'path': "/"
             }])
+
+    async def handle_captcha(self):
+        # 检测是否出现验证码
+        captcha_element = await self.context_page.query_selector('.captcha-container')
+        if captcha_element:
+            utils.logger.info("检测到验证码，请在浏览器中手动完成验证。")
+            await self.wait_for_verification_completion()
+
+    async def wait_for_verification_completion(self):
+        utils.logger.info("等待验证完成...")
+        while True:
+            # 检查验证码容器是否还存在
+            captcha_element = await self.context_page.query_selector('.captcha-container')
+            if not captcha_element:
+                utils.logger.info("验证已完成，继续执行登录流程...")
+                break
+            await asyncio.sleep(1)  # 每秒检查一次
+
+    async def wait_for_manual_verification(self):
+        utils.logger.info("请在浏览器中完成验证，完成后在控制台输入 'done' 并按回车。")
+        while True:
+            user_input = await asyncio.get_event_loop().run_in_executor(None, input, "验证完成后输入 'done': ")
+            if user_input.lower() == 'done':
+                break
+        utils.logger.info("继续执行登录流程...")
+
